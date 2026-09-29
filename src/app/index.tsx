@@ -76,8 +76,18 @@ export default function HomeSummaryScreen() {
       <Text style={styles.title}>My Home</Text>
       <Text style={styles.info}>Wi-Fi: {WIFI_LABELS[scan.wifi]}</Text>
       <Text style={styles.info}>Status: {statusText}</Text>
-      <Text style={styles.info}>mDNS: {METHOD_LABELS[scan.mdns]}</Text>
-      <Text style={styles.info}>SSDP: {METHOD_LABELS[scan.ssdp]}</Text>
+      <Text style={styles.info}>
+        mDNS: {METHOD_LABELS[scan.mdns]}
+        {scan.mdns === 'done' || scan.mdns === 'running' ? ` · ${scan.mdnsServices} services` : ''}
+      </Text>
+      <Text style={styles.info}>
+        SSDP: {METHOD_LABELS[scan.ssdp]}
+        {scan.ssdpStats
+          ? ` · ${scan.ssdpStats.replies} replies from ${scan.ssdpStats.devices} devices (sent ${scan.ssdpStats.sent}${
+              scan.ssdpStats.interfaceName ? ` on ${scan.ssdpStats.interfaceName}` : ''
+            })`
+          : ''}
+      </Text>
       <Text style={styles.info}>Devices found: {scan.devices.length}</Text>
 
       {scan.errors.map((error) => (
@@ -108,7 +118,8 @@ export default function HomeSummaryScreen() {
   const empty =
     scan.isScanning || scan.phase === 'idle' ? null : (
       <Text style={styles.empty}>
-        No devices found. Make sure this phone is on the same Wi-Fi as your devices and that Local Network access is
+        No devices answered. Make sure this phone is on the same Wi-Fi as your devices (not a guest network), and that
+        the router doesn&apos;t isolate Wi-Fi clients (&quot;AP/client isolation&quot;). On iPhone, Local Network access must be
         allowed.
       </Text>
     );

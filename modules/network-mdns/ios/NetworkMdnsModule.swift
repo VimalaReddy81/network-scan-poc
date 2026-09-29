@@ -2,55 +2,66 @@ import ExpoModulesCore
 import Foundation
 
 // Bonjour (mDNS) browser for iOS. react-native-zeroconf doesn't deliver events on iOS
-// under the New Architecture, so iOS uses this module instead (Android keeps zeroconf).
+// under the New Architecture, so this module is used instead.
 //
-// One browse runs at a time: startBrowse() stops the previous one. Every event carries the
-// browse id so JS can drop late events from a browse it has already moved past.
+// Several browses can run at once (one per service type). Every event carries the browse id
+// returned by startBrowse so JS can tell browses apart and drop late events.
 public final class NetworkMdnsModule: Module {
-  private var session: BrowseSession?
+  private var sessions: [Int: BrowseSession] = [:]
   private var nextBrowseId = 0
 
   public func definition() -> ModuleDefinition {
     Name("NetworkMdns")
 
-    Events("onResolved", "onError")
+    Events("onResolved", "onServiceType", "onError")
 
     // type is a Bonjour type such as "_googlecast._tcp." and must be listed in NSBonjourServices.
-    // Returns the browse id attached to this browse's events.
     Function("startBrowse") { (type: String) -> Int in
       self.nextBrowseId += 1
       let browseId = self.nextBrowseId
       // NetServiceBrowser delivers its callbacks on the run loop it was started on.
       DispatchQueue.main.async { [weak self] in
         guard let self else { return }
-        self.session?.stop()
         let session = BrowseSession(
           browseId: browseId,
           type: type,
           onResolved: { [weak self] payload in self?.sendEvent("onResolved", payload) },
+          onServiceType: { [weak self] payload in self?.sendEvent("onServiceType", payload) },
           onError: { [weak self] payload in self?.sendEvent("onError", payload) }
         )
-        self.session = session
+        self.sessions[browseId] = session
         session.start()
       }
       return browseId
     }
 
-    Function("stopBrowse") {
+    Function("stopBrowse") { (browseId: Int) in
       DispatchQueue.main.async { [weak self] in
-        self?.session?.stop()
-        self?.session = nil
+        self?.sessions.removeValue(forKey: browseId)?.stop()
+      }
+    }
+
+    Function("stopAll") {
+      DispatchQueue.main.async { [weak self] in
+        self?.stopAllSessions()
       }
     }
 
     OnDestroy {
       DispatchQueue.main.async { [weak self] in
-        self?.session?.stop()
-        self?.session = nil
+        self?.stopAllSessions()
       }
     }
   }
+
+  private func stopAllSessions() {
+    sessions.values.forEach { $0.stop() }
+    sessions.removeAll()
+  }
 }
+
+// DNS-SD meta-query: its results are service types on the network, not service instances.
+private let serviceTypesQuery = "_services._dns-sd._udp."
 
 private final class BrowseSession: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
   private let browseId: Int
@@ -59,6 +70,7 @@ private final class BrowseSession: NSObject, NetServiceBrowserDelegate, NetServi
   // NetService objects must stay referenced while they resolve.
   private var services: [NetService] = []
   private let onResolved: ([String: Any]) -> Void
+  private let onServiceType: ([String: Any]) -> Void
   private let onError: ([String: Any]) -> Void
   private var stopped = false
 
@@ -66,11 +78,13 @@ private final class BrowseSession: NSObject, NetServiceBrowserDelegate, NetServi
     browseId: Int,
     type: String,
     onResolved: @escaping ([String: Any]) -> Void,
+    onServiceType: @escaping ([String: Any]) -> Void,
     onError: @escaping ([String: Any]) -> Void
   ) {
     self.browseId = browseId
     self.type = type
     self.onResolved = onResolved
+    self.onServiceType = onServiceType
     self.onError = onError
   }
 
@@ -94,6 +108,12 @@ private final class BrowseSession: NSObject, NetServiceBrowserDelegate, NetServi
 
   func netServiceBrowser(_ browser: NetServiceBrowser, didFind service: NetService, moreComing: Bool) {
     guard !stopped else { return }
+    if type == serviceTypesQuery {
+      // A meta-query answer names a type: name "_googlecast", type "_tcp.local." -> "_googlecast._tcp".
+      let proto = service.type.split(separator: ".").first.map(String.init) ?? ""
+      onServiceType(["browseId": browseId, "serviceType": "\(service.name).\(proto)"])
+      return
+    }
     services.append(service)
     service.delegate = self
     service.resolve(withTimeout: 5)

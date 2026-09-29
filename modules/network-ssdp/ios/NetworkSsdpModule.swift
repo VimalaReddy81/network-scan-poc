@@ -10,13 +10,13 @@ public final class NetworkSsdpModule: Module {
   public func definition() -> ModuleDefinition {
     Name("NetworkSsdp")
 
-    // Sends one M-SEARCH and resolves with every reply received within timeoutMs:
-    // [{ ip, port, message }]. message is the raw reply text.
-    AsyncFunction("search") { (timeoutMs: Int, searchTarget: String, mx: Int, promise: Promise) in
+    // Sends M-SEARCH for each target and resolves with every reply received within timeoutMs:
+    // { replies: [{ ip, port, message }], sent, interfaceName }. message is the raw reply text.
+    AsyncFunction("search") { (timeoutMs: Int, searchTargets: [String], mx: Int, promise: Promise) in
       DispatchQueue.global(qos: .userInitiated).async {
         do {
-          let replies = try runSearch(timeoutMs: timeoutMs, searchTarget: searchTarget, mx: mx)
-          promise.resolve(replies)
+          let result = try runSearch(timeoutMs: timeoutMs, searchTargets: searchTargets, mx: mx)
+          promise.resolve(result)
         } catch let error as SsdpError {
           promise.reject(error.code, error.message)
         } catch {
@@ -36,7 +36,11 @@ private struct SsdpError: Error {
   }
 }
 
-private func runSearch(timeoutMs: Int, searchTarget: String, mx: Int) throws -> [[String: Any]] {
+// UDP drops packets, so every search target is sent this many times, this far apart.
+private let sendRepeats = 3
+private let sendSpacing: TimeInterval = 0.4
+
+private func runSearch(timeoutMs: Int, searchTargets: [String], mx: Int) throws -> [String: Any] {
   let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
   guard fd >= 0 else { throw SsdpError.posix("ERR_SSDP_SOCKET", "socket") }
   defer { close(fd) }
@@ -45,7 +49,7 @@ private func runSearch(timeoutMs: Int, searchTarget: String, mx: Int) throws -> 
   setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, socklen_t(MemoryLayout<UInt8>.size))
 
   // Short receive timeout so the loop can check the deadline.
-  var tv = timeval(tv_sec: 0, tv_usec: 250_000)
+  var tv = timeval(tv_sec: 0, tv_usec: 100_000)
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 
   var destination = sockaddr_in()
@@ -54,29 +58,41 @@ private func runSearch(timeoutMs: Int, searchTarget: String, mx: Int) throws -> 
   destination.sin_port = ssdpPort.bigEndian
   inet_pton(AF_INET, ssdpAddress, &destination.sin_addr)
 
-  let message = [
-    "M-SEARCH * HTTP/1.1",
-    "HOST: \(ssdpAddress):\(ssdpPort)",
-    "MAN: \"ssdp:discover\"",
-    "MX: \(mx)",
-    "ST: \(searchTarget)",
-    "",
-    "",
-  ].joined(separator: "\r\n")
-  let bytes = Array(message.utf8)
-
-  let sent = withUnsafePointer(to: &destination) { pointer in
-    pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { address in
-      sendto(fd, bytes, bytes.count, 0, address, socklen_t(MemoryLayout<sockaddr_in>.size))
-    }
+  let targets = searchTargets.isEmpty ? ["ssdp:all"] : searchTargets
+  let messages = targets.map { target in
+    Array([
+      "M-SEARCH * HTTP/1.1",
+      "HOST: \(ssdpAddress):\(ssdpPort)",
+      "MAN: \"ssdp:discover\"",
+      "MX: \(mx)",
+      "ST: \(target)",
+      "USER-AGENT: iOS UPnP/1.1 NetworkScanPOC/1.0",
+      "",
+      "",
+    ].joined(separator: "\r\n").utf8)
   }
-  guard sent >= 0 else { throw SsdpError.posix("ERR_SSDP_SEND", "sendto") }
 
   var replies: [[String: Any]] = []
   var buffer = [UInt8](repeating: 0, count: 8192)
-  let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000)
+  let start = Date()
+  let deadline = start.addingTimeInterval(Double(timeoutMs) / 1000)
+  var round = 0
+  var sent = 0
 
   while Date() < deadline {
+    if round < sendRepeats && Date() >= start.addingTimeInterval(Double(round) * sendSpacing) {
+      for bytes in messages {
+        let result = withUnsafePointer(to: &destination) { pointer in
+          pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { address in
+            sendto(fd, bytes, bytes.count, 0, address, socklen_t(MemoryLayout<sockaddr_in>.size))
+          }
+        }
+        if result >= 0 { sent += 1 }
+      }
+      round += 1
+      if round == sendRepeats && sent == 0 { throw SsdpError.posix("ERR_SSDP_SEND", "sendto") }
+    }
+
     var from = sockaddr_in()
     var fromLength = socklen_t(MemoryLayout<sockaddr_in>.size)
     let count = withUnsafeMutablePointer(to: &from) { pointer in
@@ -97,5 +113,5 @@ private func runSearch(timeoutMs: Int, searchTarget: String, mx: Int) throws -> 
       "message": String(decoding: buffer[0..<count], as: UTF8.self),
     ])
   }
-  return replies
+  return ["replies": replies, "sent": sent]
 }

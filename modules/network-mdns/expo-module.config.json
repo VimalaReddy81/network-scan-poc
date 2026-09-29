@@ -1,6 +1,9 @@
 {
-  "platforms": ["apple"],
+  "platforms": ["apple", "android"],
   "apple": {
     "modules": ["NetworkMdnsModule"]
+  },
+  "android": {
+    "modules": ["expo.modules.networkmdns.NetworkMdnsModule"]
   }
 }

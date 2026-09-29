@@ -1,121 +1,49 @@
-import { NativeModules, Platform } from 'react-native';
+import { Platform } from 'react-native';
 
 import NetworkMdns from '../../../modules/network-mdns';
-import { MDNS_SERVICE_TYPES, MDNS_TOTAL_BUDGET_MS } from './config';
+import { MDNS_BROWSE_MS, MDNS_SERVICE_TYPES } from './config';
 import { RawMdnsService } from './normalize-mdns';
 
-// One interface over both platforms:
-// - iOS: modules/network-mdns (Apple's Bonjour API). react-native-zeroconf doesn't deliver
-//   events on iOS under the New Architecture and can crash, so it isn't linked on iOS.
-// - Android: react-native-zeroconf with its DNSSD implementation.
+// One interface over both platforms, both served by modules/network-mdns:
+// - iOS: Apple's Bonjour API (NetServiceBrowser).
+// - Android: the system NsdManager.
+//
+// Every known service type is browsed at the same time for the whole budget. Alongside, the DNS-SD
+// meta-query (_services._dns-sd._udp) asks the network which types exist; each new type it reports
+// is browsed too. iOS only lets an app browse types listed in NSBonjourServices, so on iOS a type
+// outside that list is reported (typesNotBrowsable) but not browsed.
+
+/** The DNS-SD meta-query. Its answers are service types, not services. */
+export const SERVICE_TYPES_QUERY = '_services._dns-sd._udp';
 
 export type MdnsBrowseError = { type: string; code?: number; message: string };
+
+export type MdnsBrowseStats = {
+  /** Every type that was browsed (known list + ones the meta-query reported). */
+  typesBrowsed: string[];
+  /** Types the meta-query reported. */
+  typesDiscovered: string[];
+  /** iOS: types the meta-query reported that aren't in NSBonjourServices, so they couldn't be browsed. */
+  typesNotBrowsable: string[];
+  /** Whether the meta-query ran without an error (on iOS it needs Apple's multicast entitlement). */
+  metaQuery: 'ok' | 'failed';
+};
 
 export type MdnsBrowseOptions = {
   onService: (service: RawMdnsService) => void;
   onError?: (error: MdnsBrowseError) => void;
   isCancelled?: () => boolean;
   types?: readonly string[];
-  totalBudgetMs?: number;
-};
-
-type Browser = {
-  browse(type: string, onService: (s: RawMdnsService) => void, onError: (e: MdnsBrowseError) => void): void;
-  stop(): void;
-  dispose(): void;
+  durationMs?: number;
 };
 
 export function isMdnsAvailable(): boolean {
-  if (Platform.OS === 'ios') return !!NetworkMdns;
-  if (Platform.OS === 'android') return !!NativeModules.RNZeroconf;
-  return false;
+  return (Platform.OS === 'ios' || Platform.OS === 'android') && !!NetworkMdns;
 }
 
-function iosBrowser(): Browser {
-  const module = NetworkMdns!;
-  let browseId = -1;
-  let subscriptions: { remove(): void }[] = [];
-  const removeListeners = () => {
-    subscriptions.forEach((s) => s.remove());
-    subscriptions = [];
-  };
-
-  return {
-    browse(type, onService, onError) {
-      removeListeners();
-      subscriptions = [
-        module.addListener('onResolved', (s) => {
-          if (s.browseId !== browseId) return;
-          onService({
-            platform: 'ios',
-            type,
-            name: s.name,
-            fullName: s.fullName,
-            host: s.host,
-            port: s.port,
-            addresses: s.addresses,
-            txt: s.txt,
-          });
-        }),
-        module.addListener('onError', (e) => {
-          if (e.browseId === browseId) onError({ type, code: e.code, message: e.message });
-        }),
-      ];
-      browseId = module.startBrowse(`${type}.`);
-    },
-    stop() {
-      module.stopBrowse();
-      browseId = -1;
-    },
-    dispose() {
-      module.stopBrowse();
-      removeListeners();
-    },
-  };
-}
-
-function androidBrowser(): Browser {
-  // Required lazily so iOS (where the native side isn't linked) never loads it.
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const Zeroconf = require('react-native-zeroconf').default;
-  const zeroconf = new Zeroconf();
-  let current: { type: string; onService: (s: RawMdnsService) => void; onError: (e: MdnsBrowseError) => void } | null =
-    null;
-
-  zeroconf.on('resolved', (s: any) => {
-    if (!current) return;
-    current.onService({
-      platform: 'android',
-      type: current.type,
-      name: s.name,
-      fullName: s.fullName,
-      host: s.host,
-      port: typeof s.port === 'number' ? s.port : undefined,
-      addresses: s.addresses ?? [],
-      txt: s.txt ?? {},
-    });
-  });
-  zeroconf.on('error', (error: unknown) => {
-    current?.onError({ type: current.type, message: String((error as Error)?.message ?? error) });
-  });
-
-  return {
-    browse(type, onService, onError) {
-      current = { type, onService, onError };
-      const [, name, protocol] = type.match(/^_([^.]+)\._(tcp|udp)$/) ?? [];
-      zeroconf.scan(name, protocol, 'local.', 'DNSSD');
-    },
-    stop() {
-      current = null;
-      zeroconf.stop('DNSSD');
-    },
-    dispose() {
-      current = null;
-      zeroconf.stop('DNSSD');
-      zeroconf.removeDeviceListeners();
-      zeroconf.removeAllListeners();
-    },
-  };
+/** "_googlecast._tcp." / "_googlecast._tcp.local." -> "_googlecast._tcp". */
+export function cleanServiceType(type: string): string {
+  return type.trim().replace(/\.$/, '').replace(/\.local$/i, '');
 }
 
 /** Waits ms, returning early (checked every 100 ms) once the scan is cancelled. */
@@ -126,29 +54,98 @@ async function waitUnlessCancelled(ms: number, isCancelled: () => boolean) {
   }
 }
 
-/**
- * Browses each service type one after another (both platforms run one browse at a time).
- * The types share one budget: 15 s over 6 types is ~2.5 s each.
- */
 export async function browseMdns({
   onService,
   onError = () => {},
   isCancelled = () => false,
   types = MDNS_SERVICE_TYPES,
-  totalBudgetMs = MDNS_TOTAL_BUDGET_MS,
-}: MdnsBrowseOptions): Promise<void> {
+  durationMs = MDNS_BROWSE_MS,
+}: MdnsBrowseOptions): Promise<MdnsBrowseStats> {
   if (!isMdnsAvailable()) throw new Error('mDNS is not available in this build');
+  const module = NetworkMdns!;
+  const platform = Platform.OS === 'ios' ? 'ios' : 'android';
+  const knownTypes = types.map((name) => `_${name}._tcp`);
+  // iOS can only browse what the build declares in NSBonjourServices (kept in sync with MDNS_SERVICE_TYPES).
+  const browsable = (type: string) => platform === 'android' || knownTypes.includes(type);
 
-  const browser = Platform.OS === 'ios' ? iosBrowser() : androidBrowser();
-  const perTypeMs = Math.floor(totalBudgetMs / types.length);
+  // browse id -> service type. Events for ids not in here (an earlier scan) are dropped.
+  const browses = new Map<number, string>();
+  const browsedTypes = new Set<string>();
+  const stats: MdnsBrowseStats = { typesBrowsed: [], typesDiscovered: [], typesNotBrowsable: [], metaQuery: 'ok' };
+  let metaBrowseId = -1;
+
+  const browse = (type: string) => {
+    if (browsedTypes.has(type) || isCancelled()) return;
+    browsedTypes.add(type);
+    const browseId = module.startBrowse(`${type}.`);
+    browses.set(browseId, type);
+    console.log(`[NetworkScan][mDNS] browse started: ${type} (browseId ${browseId})`);
+  };
+
+  const subscriptions = [
+    module.addListener('onResolved', (s) => {
+      const type = browses.get(s.browseId);
+      if (!type || isCancelled()) return;
+      console.log(
+        `[NetworkScan] mDNS service discovered: ${type} "${s.name}" host=${s.host || '-'} port=${s.port} ` +
+          `addresses=${s.addresses.join(',') || '-'} txt=${JSON.stringify(s.txt)}`
+      );
+      onService({
+        platform,
+        type,
+        name: s.name,
+        fullName: s.fullName,
+        host: s.host,
+        port: s.port,
+        addresses: s.addresses,
+        txt: s.txt,
+      });
+    }),
+    module.addListener('onServiceType', (e) => {
+      if (e.browseId !== metaBrowseId || isCancelled()) return;
+      const type = cleanServiceType(e.serviceType);
+      if (!/^_[^.]+\._(tcp|udp)$/.test(type) || stats.typesDiscovered.includes(type)) return;
+      stats.typesDiscovered.push(type);
+      if (!browsable(type)) {
+        stats.typesNotBrowsable.push(type);
+        console.log(`[NetworkScan] mDNS type on network: ${type} (not browsable on iOS: not in NSBonjourServices)`);
+        return;
+      }
+      console.log(
+        `[NetworkScan] mDNS type on network: ${type}${browsedTypes.has(type) ? ' (already browsing)' : ' -> browsing'}`
+      );
+      browse(type);
+    }),
+    module.addListener('onError', (e) => {
+      if (e.browseId === metaBrowseId) {
+        // Expected on iOS without the multicast entitlement; the known types are still browsed.
+        stats.metaQuery = 'failed';
+        console.log(`[NetworkScan] mDNS meta-query (${SERVICE_TYPES_QUERY}) unavailable: ${e.message} (${e.code})`);
+        return;
+      }
+      const type = browses.get(e.browseId);
+      console.log(`[NetworkScan][mDNS] browse error: ${type ?? `browseId ${e.browseId}`} ${e.message} (${e.code})`);
+      if (type) onError({ type, code: e.code, message: e.message });
+    }),
+  ];
+
   try {
-    for (const name of types) {
-      if (isCancelled()) break;
-      browser.browse(`_${name}._tcp`, onService, onError);
-      await waitUnlessCancelled(perTypeMs, isCancelled);
-      browser.stop();
-    }
+    console.log(`[NetworkScan] mDNS started: browsing ${knownTypes.join(', ')} + ${SERVICE_TYPES_QUERY}`);
+    knownTypes.forEach(browse);
+    metaBrowseId = module.startBrowse(`${SERVICE_TYPES_QUERY}.`);
+    await waitUnlessCancelled(durationMs, isCancelled);
   } finally {
-    browser.dispose();
+    console.log(`[NetworkScan][mDNS] stopping ${browses.size} browses + meta-query`);
+    if (metaBrowseId !== -1) module.stopBrowse(metaBrowseId);
+    for (const browseId of browses.keys()) module.stopBrowse(browseId);
+    subscriptions.forEach((s) => s.remove());
   }
+
+  stats.typesBrowsed = [...browsedTypes];
+  console.log(
+    `[NetworkScan] mDNS finished: browsed ${stats.typesBrowsed.length} types, meta-query ${stats.metaQuery}, ` +
+      `discovered types [${stats.typesDiscovered.join(', ')}]` +
+      (stats.typesNotBrowsable.length ? `, not browsable on iOS [${stats.typesNotBrowsable.join(', ')}]` : '')
+  );
+  return stats;
 }

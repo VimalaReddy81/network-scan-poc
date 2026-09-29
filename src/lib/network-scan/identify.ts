@@ -44,6 +44,10 @@ const SERVICE_FALLBACKS: { service: string; deviceType: DeviceType; reason: stri
   { service: '_googlecast._tcp', deviceType: 'Media Streamer', reason: 'Supports Google Cast' },
   { service: '_airplay._tcp', deviceType: 'Media Streamer', reason: 'Supports AirPlay' },
   { service: '_raop._tcp', deviceType: 'Speaker', reason: 'Supports AirPlay audio' },
+  { service: '_ipp._tcp', deviceType: 'Printer', reason: 'Offers printing (IPP)' },
+  { service: '_printer._tcp', deviceType: 'Printer', reason: 'Offers printing (LPD)' },
+  { service: '_spotify-connect._tcp', deviceType: 'Speaker', reason: 'Supports Spotify Connect' },
+  { service: '_smb._tcp', deviceType: 'Network Storage', reason: 'Shares files (SMB)' },
   { service: 'urn:schemas-upnp-org:device:MediaRenderer:1', deviceType: 'Media Streamer', reason: 'UPnP media renderer' },
   { service: 'urn:schemas-upnp-org:device:InternetGatewayDevice:1', deviceType: 'Router', reason: 'UPnP internet gateway' },
 ];

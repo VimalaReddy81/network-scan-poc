@@ -8,10 +8,11 @@ live status.
 ## How a scan works
 
 1. **Wi-Fi check** (`expo-network`). Off Wi-Fi, the scan stops with a "Wi-Fi Required" alert.
-2. **mDNS**: six service types (`googlecast`, `airplay`, `raop`, `http`, `https`, `sonos`) one after another,
-   sharing a 15 s budget (~2.5 s each).
-3. **SSDP**, alongside mDNS: one 3 s `M-SEARCH` to `239.255.255.250:1900`, then each device's UPnP description
-   (friendly name, manufacturer, model), fetched only from the IP that replied, with a 2 s timeout.
+2. **mDNS**: eleven service types (`googlecast`, `airplay`, `raop`, `http`, `https`, `sonos`, `ipp`, `printer`,
+   `hap`, `spotify-connect`, `smb`), all browsed at the same time for 10 s.
+3. **SSDP**, alongside mDNS: `M-SEARCH` for `ssdp:all`, `upnp:rootdevice` and the LG webOS targets (`webos-second-screen`,
+   DIAL, `MediaRenderer`) to `239.255.255.250:1900`, each sent 3 times (UDP drops packets), listening for 4 s. Then each device's UPnP description (friendly name,
+   manufacturer, model) is fetched, only from the IP that replied, with a 2 s timeout.
 4. **Normalize and merge**: both are turned into one `DiscoveredDevice` shape. Results that share any identity
    key (`udn > mac > castid > host > ip`) collapse into one device, including chains.
 5. **Display**: one card per device. Missing values show as "Not available".
@@ -20,11 +21,10 @@ live status.
 
 | Piece | Platform | Why |
 | --- | --- | --- |
-| `modules/network-mdns` (Swift, `NetServiceBrowser`) | iOS | `react-native-zeroconf` doesn't deliver events on iOS under the New Architecture and can crash, so iOS uses this module. |
-| `react-native-zeroconf` (DNSSD) | Android | Works there. `react-native.config.js` keeps it out of the iOS build. |
-| `modules/network-ssdp` (Swift + Kotlin) | both | Raw UDP `M-SEARCH`. On Android it holds a Wi-Fi multicast lock, since some drivers otherwise drop multicast. |
+| `modules/network-mdns` (Swift + Kotlin) | both | iOS: Apple's Bonjour API (`NetServiceBrowser`). Android: the system `NsdManager`. Browses every type at once. (`react-native-zeroconf` doesn't deliver events on iOS under the New Architecture, and on Android it could only browse one type at a time.) |
+| `modules/network-ssdp` (Swift + Kotlin) | both | Raw UDP `M-SEARCH`. On Android the socket is bound to the Wi-Fi network and interface (so it never goes out over mobile data), and it holds a Wi-Fi multicast lock, since some drivers otherwise drop multicast. |
 
-`src/lib/network-scan/mdns-browser.ts` puts one interface over both platforms. Both native modules load as
+`src/lib/network-scan/mdns-browser.ts` wraps the mDNS module for both platforms. Both native modules load as
 optional: an older dev build still runs and reports the scan as unavailable.
 
 ## Code
@@ -78,6 +78,17 @@ npm test                        # unit tests for the JS pipeline
 
 On the first scan, iOS asks for Local Network access. Tap **Allow**. To change it later, go to Settings → Privacy &
 Security → Local Network.
+
+## If a scan finds nothing
+
+The status lines show what each method did: `mDNS: Done · N services` and
+`SSDP: Done · N replies from N devices (sent N on wlan0)`.
+
+- **0 mDNS services and 0 SSDP replies** usually means the network isn't passing multicast between Wi-Fi clients:
+  a guest network, "AP/client isolation", or some mesh/extender setups. Check with another discovery app (for
+  example a Bonjour/UPnP browser) on the same phone and Wi-Fi.
+- **SSDP sent 0** means the phone couldn't send on Wi-Fi at all.
+- On Android, Metro/logcat shows `[NetworkScan] …` lines (JS) and `NetworkSsdp` / `NetworkMdns` tags (native).
 
 ## Known gaps
 

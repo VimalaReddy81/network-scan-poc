@@ -5,7 +5,7 @@ import { Alert } from 'react-native';
 import { browseMdns, isMdnsAvailable, MdnsBrowseError } from '@/lib/network-scan/mdns-browser';
 import { mergeDevices } from '@/lib/network-scan/merge';
 import { normalizeMdns } from '@/lib/network-scan/normalize-mdns';
-import { scanSsdp, ssdpAvailability } from '@/lib/network-scan/ssdp-scan';
+import { scanSsdp, ssdpAvailability, SsdpScanStats } from '@/lib/network-scan/ssdp-scan';
 import { DiscoveredDevice } from '@/lib/network-scan/types';
 
 export type WifiStatus = 'checking' | 'connected' | 'not-connected';
@@ -19,6 +19,9 @@ export type NetworkScanState = {
   ssdp: MethodStatus;
   devices: DiscoveredDevice[];
   errors: string[];
+  /** Resolved mDNS services this scan (before merging into devices). */
+  mdnsServices: number;
+  ssdpStats?: SsdpScanStats;
   finishedAt?: number;
 };
 
@@ -29,6 +32,7 @@ const initialState: NetworkScanState = {
   ssdp: 'idle',
   devices: [],
   errors: [],
+  mdnsServices: 0,
 };
 
 async function checkWifi(): Promise<boolean> {
@@ -90,9 +94,15 @@ export function useNetworkScan() {
     const mdnsAvailable = isMdnsAvailable();
     const found: DiscoveredDevice[] = [];
     const errors = new Set<string>();
+    let mdnsServices = 0;
     const addDevice = (device: DiscoveredDevice) => {
       found.push(device);
-      update(id, () => ({ devices: mergeDevices(found) }));
+      const merged = mergeDevices(found);
+      console.log(
+        `[NetworkScan] Device normalized (${device.sources.join('+')}): ${device.id} name=${device.name ?? '-'} ` +
+          `ip=${device.ip ?? '-'} services=${device.services.join(',')} -> ${merged.length} unique devices`
+      );
+      update(id, () => ({ devices: merged }));
     };
     const addError = (message: string) => {
       errors.add(message);
@@ -106,18 +116,27 @@ export function useNetworkScan() {
       ssdp: ssdpState === 'available' ? 'running' : ssdpState,
       devices: [],
       errors: [],
+      mdnsServices: 0,
     });
+    console.log(`[NetworkScan] Scan started (mDNS ${mdnsAvailable ? 'available' : 'unavailable'}, SSDP ${ssdpState})`);
     if (!mdnsAvailable && ssdpState === 'unavailable') {
       addError('Network scanning is not available in this build. Install a new development build.');
     }
 
     const mdns = mdnsAvailable
       ? browseMdns({
-          onService: (raw) => addDevice(normalizeMdns(raw)),
+          onService: (raw) => {
+            mdnsServices += 1;
+            update(id, () => ({ mdnsServices }));
+            addDevice(normalizeMdns(raw));
+          },
           onError: (error) => addError(describeMdnsError(error)),
           isCancelled,
         }).then(
-          () => update(id, () => ({ mdns: 'done' })),
+          (mdnsStats) => {
+            console.log('[NetworkScan] mDNS stats', JSON.stringify(mdnsStats));
+            update(id, () => ({ mdns: 'done' }));
+          },
           (error) => {
             addError(`mDNS scan failed: ${String(error?.message ?? error)}`);
             update(id, () => ({ mdns: 'failed' }));
@@ -128,7 +147,10 @@ export function useNetworkScan() {
     const ssdp =
       ssdpState === 'available'
         ? scanSsdp(addDevice, isCancelled).then(
-            () => update(id, () => ({ ssdp: 'done' })),
+            (ssdpStats) => {
+              console.log('[NetworkScan] SSDP', JSON.stringify(ssdpStats));
+              update(id, () => ({ ssdp: 'done', ssdpStats }));
+            },
             (error) => {
               addError(`SSDP scan failed: ${String(error?.message ?? error)}`);
               update(id, () => ({ ssdp: 'failed' }));
@@ -137,6 +159,7 @@ export function useNetworkScan() {
         : Promise.resolve();
 
     await Promise.all([mdns, ssdp]);
+    console.log(`[NetworkScan] Scan completed: ${mergeDevices(found).length} devices, ${mdnsServices} mDNS services`);
     update(id, () => ({ phase: 'done', finishedAt: Date.now() }));
   }, [update]);
 

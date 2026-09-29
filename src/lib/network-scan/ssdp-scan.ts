@@ -1,7 +1,13 @@
 import { Platform } from 'react-native';
 
 import NetworkSsdp from '../../../modules/network-ssdp';
-import { SSDP_DESCRIPTION_TIMEOUT_MS, SSDP_ENABLED_ON_IOS, SSDP_MX_SECONDS, SSDP_SEARCH_MS } from './config';
+import {
+  SSDP_DESCRIPTION_TIMEOUT_MS,
+  SSDP_ENABLED_ON_IOS,
+  SSDP_MX_SECONDS,
+  SSDP_SEARCH_MS,
+  SSDP_SEARCH_TARGETS,
+} from './config';
 import {
   hostFromUrl,
   normalizeSsdp,
@@ -14,6 +20,9 @@ import {
 import { DiscoveredDevice } from './types';
 
 export type SsdpReply = { ip: string; headers: SsdpHeaders };
+
+/** What a search did, for the on-screen diagnostics. */
+export type SsdpScanStats = { sent: number; replies: number; devices: number; interfaceName?: string };
 
 export type SsdpAvailability = 'available' | 'disabled-on-ios' | 'unavailable';
 
@@ -66,25 +75,52 @@ export async function fetchDescription(
 }
 
 /**
- * Sends one M-SEARCH (ssdp:all) to 239.255.255.250:1900, then reads each device's
- * description for its friendly name, manufacturer and model. Calls onDevice per device.
+ * Sends M-SEARCH (ssdp:all and upnp:rootdevice, each repeated) to 239.255.255.250:1900, then reads
+ * each device's description for its friendly name, manufacturer and model. Calls onDevice per device.
  */
 export async function scanSsdp(
   onDevice: (device: DiscoveredDevice) => void,
   isCancelled: () => boolean = () => false
-): Promise<void> {
+): Promise<SsdpScanStats> {
   if (!NetworkSsdp) throw new Error('SSDP is not available in this build');
 
-  const raw = await NetworkSsdp.search(SSDP_SEARCH_MS, 'ssdp:all', SSDP_MX_SECONDS);
-  if (isCancelled()) return;
-
-  const replies = dedupeReplies(raw.map((r) => ({ ip: r.ip, headers: parseSsdpHeaders(r.message) })));
+  console.log(
+    `[NetworkScan][SSDP] searching ${SSDP_SEARCH_TARGETS.join(', ')} -> 239.255.255.250:1900 (${SSDP_SEARCH_MS} ms, MX ${SSDP_MX_SECONDS})`
+  );
+  const result = await NetworkSsdp.search(SSDP_SEARCH_MS, SSDP_SEARCH_TARGETS, SSDP_MX_SECONDS);
+  console.log(
+    `[NetworkScan][SSDP] sent ${result.sent} requests on ${result.interfaceName ?? 'default network'}, ` +
+      `received ${result.replies.length} UDP responses`
+  );
+  for (const r of result.replies) {
+    const h = parseSsdpHeaders(r.message);
+    console.log(
+      `[NetworkScan][SSDP] response from ${r.ip}:${r.port} ST=${h.st ?? '-'} USN=${h.usn ?? '-'} ` +
+        `SERVER=${h.server ?? '-'} LOCATION=${h.location ?? '-'}`
+    );
+  }
+  const replies = dedupeReplies(
+    result.replies.map((r) => ({ ip: r.ip, headers: parseSsdpHeaders(r.message) }))
+  );
+  const stats: SsdpScanStats = {
+    sent: result.sent,
+    replies: result.replies.length,
+    devices: replies.length,
+    interfaceName: result.interfaceName ?? undefined,
+  };
+  if (isCancelled()) return stats;
   const seenAt = Date.now();
 
   await Promise.all(
     replies.map(async (reply) => {
-      const description = canFetchDescription(reply) ? await fetchDescription(reply.headers.location) : {};
+      const fetchable = canFetchDescription(reply);
+      const description = fetchable ? await fetchDescription(reply.headers.location) : {};
+      console.log(
+        `[NetworkScan][SSDP] description ${reply.ip}: ` +
+          (fetchable ? JSON.stringify(description) : `not fetched (LOCATION=${reply.headers.location ?? '-'})`)
+      );
       if (!isCancelled()) onDevice(normalizeSsdp(reply, description, seenAt));
     })
   );
+  return stats;
 }

@@ -6,6 +6,7 @@ import { displayFields, NOT_AVAILABLE } from '../display';
 import { enrich, matchKnown } from '../enrich';
 import { identityKeys, keysConflict, macFromSonosId, normalizeMac } from '../fingerprint';
 import { identify } from '../identify';
+import { cleanServiceType } from '../mdns-browser';
 import { mergeDevices } from '../merge';
 import { normalizeMdns, normalizeServiceType, pickIp, RawMdnsService } from '../normalize-mdns';
 import { normalizeSsdp, parseSsdpHeaders, parseUpnpDescription, udnFromUsn } from '../normalize-ssdp';
@@ -298,6 +299,31 @@ describe('platform parsing', () => {
     expect(d.identityKeys).toEqual(['ip:10.0.0.5']);
   });
 
+  it('Android (NsdManager): empty host, IPv4 first, printer identified by protocol', () => {
+    const d = normalizeMdns(
+      {
+        platform: 'android',
+        type: '_ipp._tcp',
+        name: 'Office Printer',
+        fullName: 'Office Printer._ipp._tcp.local.',
+        host: '',
+        addresses: ['192.168.1.44', 'fe80::2'],
+        port: 631,
+        txt: { ty: 'HP LaserJet' },
+      },
+      T
+    );
+    expect(d).toMatchObject({ name: 'Office Printer', ip: '192.168.1.44', ports: [631] });
+    expect(d.hostname).toBeUndefined();
+    expect(identify(d).deviceType).toBe('Printer');
+  });
+
+  it('cleans meta-query service types, including UDP types', () => {
+    expect(cleanServiceType('_googlecast._tcp.local.')).toBe('_googlecast._tcp');
+    expect(cleanServiceType('_matterc._udp.')).toBe('_matterc._udp');
+    expect(normalizeServiceType('_matterc._udp')).toBe('_matterc._udp');
+  });
+
   it('iOS: recovers the instance name from fullName when name is missing', () => {
     expect(mdns({ type: '_http._tcp.', fullName: 'Printer._http._tcp.local.' }).name).toBe('Printer');
     expect(normalizeServiceType('_http._tcp.')).toBe('_http._tcp');
@@ -320,6 +346,43 @@ describe('platform parsing', () => {
       udn: 'uuid:RINCON_B8E937AABBCC01400',
       deviceType: 'urn:schemas-upnp-org:device:ZonePlayer:1',
     });
+  });
+
+  it('LG webOS: replies to LG search targets collapse to one device with the reported name and model', () => {
+    const usn = 'uuid:12345678-abcd-ef01-2345-6789abcdef01';
+    const location = 'http://192.168.1.50:1990/device.xml';
+    const replies = dedupeReplies([
+      { ip: '192.168.1.50', headers: parseSsdpHeaders(`HTTP/1.1 200 OK\r\nLOCATION: ${location}\r\nST: urn:lge-com:service:webos-second-screen:1\r\nUSN: ${usn}::urn:lge-com:service:webos-second-screen:1\r\n\r\n`) },
+      { ip: '192.168.1.50', headers: parseSsdpHeaders(`HTTP/1.1 200 OK\r\nLOCATION: ${location}\r\nST: urn:dial-multiscreen-org:service:dial:1\r\nUSN: ${usn}::urn:dial-multiscreen-org:service:dial:1\r\n\r\n`) },
+    ]);
+    expect(replies).toHaveLength(1);
+    expect(canFetchDescription(replies[0])).toBe(true);
+
+    const description = parseUpnpDescription(`<?xml version="1.0"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <device>
+    <deviceType>urn:schemas-upnp-org:device:Basic:1</deviceType>
+    <friendlyName>[LG] webOS TV OLED55C1PUB</friendlyName>
+    <manufacturer>LG Electronics</manufacturer>
+    <modelName>OLED55C1PUB</modelName>
+    <UDN>${usn}</UDN>
+  </device>
+</root>`);
+    const d = normalizeSsdp(replies[0], description, T);
+    expect(d).toMatchObject({
+      name: '[LG] webOS TV OLED55C1PUB',
+      manufacturer: 'LG Electronics',
+      model: 'OLED55C1PUB',
+      ip: '192.168.1.50',
+      ports: [1990],
+    });
+    expect(d.id).toBe(`udn:${usn}`);
+  });
+
+  it('does not report an LG manufacturer for an SSDP device that does not say so', () => {
+    const d = normalizeSsdp({ ip: '192.168.1.60', headers: { st: 'urn:dial-multiscreen-org:service:dial:1' } }, {}, T);
+    expect(d.manufacturer).toBeUndefined();
+    expect(d.model).toBeUndefined();
   });
 
   it('keeps one SSDP reply per device and fetches only from the replying IP', () => {

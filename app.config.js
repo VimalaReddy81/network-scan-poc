@@ -18,6 +18,13 @@ module.exports = ({ config }) => ({
         '_http._tcp',
         '_https._tcp',
         '_sonos._tcp',
+        '_ipp._tcp',
+        '_printer._tcp',
+        '_hap._tcp',
+        '_spotify-connect._tcp',
+        '_smb._tcp',
+        // DNS-SD meta-query (lists every service type). iOS also needs the multicast entitlement for it.
+        '_services._dns-sd._udp',
       ],
       // Allow plain-HTTP requests to LAN devices (UPnP description XML).
       NSAppTransportSecurity: { NSAllowsLocalNetworking: true },
