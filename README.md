@@ -1,56 +1,87 @@
-# Welcome to your Expo app 👋
+# Network Scan POC
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+A single-screen Expo / React Native app (iOS + Android) that runs a one-time scan of the home Wi-Fi while the
+app is open (never in the background). It finds devices with **mDNS / Bonjour** and **SSDP / UPnP** and shows
+each device once, even when both methods find it. What's shown is what the network reports: a best guess, not a
+live status.
 
-## Get started
+## How a scan works
 
-1. Install dependencies
+1. **Wi-Fi check** (`expo-network`). Off Wi-Fi, the scan stops with a "Wi-Fi Required" alert.
+2. **mDNS**: six service types (`googlecast`, `airplay`, `raop`, `http`, `https`, `sonos`) one after another,
+   sharing a 15 s budget (~2.5 s each).
+3. **SSDP**, alongside mDNS: one 3 s `M-SEARCH` to `239.255.255.250:1900`, then each device's UPnP description
+   (friendly name, manufacturer, model), fetched only from the IP that replied, with a 2 s timeout.
+4. **Normalize and merge**: both are turned into one `DiscoveredDevice` shape. Results that share any identity
+   key (`udn > mac > castid > host > ip`) collapse into one device, including chains.
+5. **Display**: one card per device. Missing values show as "Not available".
 
-   ```bash
-   npm install
-   ```
+## Native layer
 
-2. Start the app
+| Piece | Platform | Why |
+| --- | --- | --- |
+| `modules/network-mdns` (Swift, `NetServiceBrowser`) | iOS | `react-native-zeroconf` doesn't deliver events on iOS under the New Architecture and can crash, so iOS uses this module. |
+| `react-native-zeroconf` (DNSSD) | Android | Works there. `react-native.config.js` keeps it out of the iOS build. |
+| `modules/network-ssdp` (Swift + Kotlin) | both | Raw UDP `M-SEARCH`. On Android it holds a Wi-Fi multicast lock, since some drivers otherwise drop multicast. |
 
-   ```bash
-   npx expo start
-   ```
+`src/lib/network-scan/mdns-browser.ts` puts one interface over both platforms. Both native modules load as
+optional: an older dev build still runs and reports the scan as unavailable.
 
-In the output, you'll find options to open the app in a
+## Code
 
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
+| Path | Purpose |
+| --- | --- |
+| `src/app/index.tsx` | Home Summary screen: Wi-Fi, device count, mDNS/SSDP status, errors, cards, "Not seen in latest scan" |
+| `src/hooks/use-network-scan.ts` | Runs the scan (start/stop, cancelled on stop or unmount); readable iOS errors (-72008, -65570) |
+| `src/queries/devices.ts` | TanStack Query hooks: `useKnownDevices`, `useSaveHomeDevice`, `useSubmitDeviceScan` |
+| `src/components/scanned-device-card.tsx` | Network-only card, and a fuller card (confidence, reasons, Add to Home / Assign Room) |
+| `src/lib/network-scan/config.ts` | Feature switches and timings |
+| `src/lib/network-scan/types.ts` | `DiscoveredDevice`, `KnownDevice`, `HomeDevice` (a missing device is "not seen", never "offline") |
+| `src/lib/network-scan/normalize-mdns.ts` / `normalize-ssdp.ts` | Raw results → devices; platform differences; UPnP XML parsing |
+| `src/lib/network-scan/fingerprint.ts` / `merge.ts` | Identity keys, MAC rules, merging |
+| `src/lib/network-scan/ssdp-scan.ts` | SSDP search, one reply per device, description fetch |
+| `src/lib/network-scan/identify.ts` / `room.ts` / `confidence.ts` / `enrich.ts` | Home Intelligence (off by default) |
+| `src/lib/network-scan/device-repository.ts` | In-memory mock backend, shaped for `POST /homes/{homeId}/devices/scan` |
+| `src/lib/network-scan/display.ts` | Fields shown on each card |
 
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
+A MAC is only used when the device advertises it itself (Sonos RINCON ids, AirPlay `deviceid`, RAOP names). It's
+never read from the network's address tables, and placeholder MACs (including `02:00:00:00:00:00`) are rejected.
 
-## Get a fresh project
+## Feature switches (`src/lib/network-scan/config.ts`)
 
-When you're ready, run:
+- `HOME_INTELLIGENCE_ENABLED = false`: identification, room suggestions, confidence ("Probably" / "Still
+  learning") and known-device matching are built but off. The scan shows only what the network reports.
+- `SSDP_ENABLED_ON_IOS = false`: iOS only lets an app send multicast with Apple's
+  `com.apple.developer.networking.multicast` entitlement. Request it at
+  https://developer.apple.com/contact/request/networking-multicast, then uncomment `entitlements` in
+  `app.config.js` and set this to `true`. Until then iOS scans are mDNS-only; Android runs both.
+
+## Configuration (`app.config.js`)
+
+- **iOS**: `NSLocalNetworkUsageDescription`, `NSBonjourServices` (keep in sync with `MDNS_SERVICE_TYPES`),
+  `NSAllowsLocalNetworking`.
+- **Android**: `ACCESS_WIFI_STATE`, `CHANGE_WIFI_MULTICAST_STATE` (plus `INTERNET`, `ACCESS_NETWORK_STATE`), and
+  `usesCleartextTraffic` (via `expo-build-properties`) for the UPnP XML.
+
+`ios/` and `android/` are generated by `npx expo prebuild` / `npx expo run:*`. Don't edit them by hand.
+
+## Run on real devices (same Wi-Fi as the devices to find)
+
+This app has native code, so it **does not run in Expo Go**. After pulling these changes, make a new build.
 
 ```bash
-npm run reset-project
+npm install
+npx expo run:ios --device       # iPhone: USB, Developer Mode on
+npx expo run:android --device   # Android: USB debugging on; needs Android Studio / SDK
+npm test                        # unit tests for the JS pipeline
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+On the first scan, iOS asks for Local Network access. Tap **Allow**. To change it later, go to Settings → Privacy &
+Security → Local Network.
 
-### Other setup steps
+## Known gaps
 
-- To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
-- If you'd like to set up unit testing, follow our guide on ["Unit Testing with Jest"](https://docs.expo.dev/develop/unit-testing/)
-- Learn more about the TypeScript setup in this template in our guide on ["Using TypeScript"](https://docs.expo.dev/guides/typescript/)
-
-## Learn more
-
-To learn more about developing your project with Expo, look at the following resources:
-
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
-
-## Join the community
-
-Join our community of developers creating universal apps.
-
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+- Saved devices live only in memory (mock repository); they're lost when the app restarts.
+- SSDP on iOS needs Apple's multicast entitlement before it can be turned on.
+- Cross-check from a Mac on the same Wi-Fi: `dns-sd -B _googlecast._tcp`. The iOS Simulator uses the Mac's network,
+  so it also shows services the Mac itself advertises.

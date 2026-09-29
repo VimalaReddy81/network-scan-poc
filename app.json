@@ -8,7 +8,23 @@
     "scheme": "networkscanpoc",
     "userInterfaceStyle": "automatic",
     "ios": {
-      "icon": "./assets/expo.icon"
+      "icon": "./assets/expo.icon",
+      "bundleIdentifier": "com.example.networkscanpoc",
+      "infoPlist": {
+        "NSLocalNetworkUsageDescription": "Network Scan POC looks for devices and services on your Wi-Fi network.",
+        "NSBonjourServices": [
+          "_googlecast._tcp",
+          "_airplay._tcp",
+          "_raop._tcp",
+          "_http._tcp",
+          "_https._tcp",
+          "_sonos._tcp"
+        ],
+        "NSAppTransportSecurity": {
+          "NSAllowsLocalNetworking": true
+        },
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -37,6 +53,12 @@
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "df58fd20-a64e-47d9-9a30-ded5215d222c"
+      }
     }
   }
 }
